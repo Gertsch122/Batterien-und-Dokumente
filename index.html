@@ -139,6 +139,10 @@ select.field{appearance:none}
 nav.bottom a.alert{color:var(--bad)}
 nav.bottom a{font-size:13px;letter-spacing:.03em;text-align:center;padding-inline:2px}
 .h2{margin:0;font-weight:400;font-size:24px;letter-spacing:.06em;color:var(--ftx);overflow-wrap:anywhere}
+.auth{position:fixed;inset:0;z-index:20;background:var(--bg);color:var(--tx);overflow:auto;padding:max(24px,env(safe-area-inset-top,0px)) 16px 32px}
+.authbox{max-width:440px;margin:6vh auto 0}
+.auth h2{margin:4px 0 10px;font-weight:400;font-size:26px;letter-spacing:.12em;color:var(--ac)}
+.auth .ok{color:var(--tx)}
 </style>
 <header class="top">
   <div class="wrap">
@@ -163,6 +167,7 @@ nav.bottom a{font-size:13px;letter-spacing:.03em;text-align:center;padding-inlin
     <input class="field" id="pTitle" maxlength="40" placeholder="Batterien und Dokumente"></div>
     </div>
     <div class="row" style="margin-top:12px"><button class="btn solid" id="pSave" type="button">Speichern</button><button class="btn" id="pCancel" type="button">Schließen</button></div>
+    <p class="status" id="acct" style="margin-top:12px"></p>
   </div>
 </div>
 <main><div class="wrap" id="view"></div></main>
@@ -175,10 +180,22 @@ nav.bottom a{font-size:13px;letter-spacing:.03em;text-align:center;padding-inlin
   </div>
 </nav>
 <div class="toast" id="toast" hidden role="status"></div>
+<div class="auth" id="auth" hidden role="dialog" aria-modal="true" aria-labelledby="authTitle">
+  <div class="authbox">
+    <p class="eyebrow" id="authApp">BATTERIEN UND DOKUMENTE</p>
+    <h2 id="authTitle">ANMELDUNG</h2>
+    <p class="status" id="authInfo">Mit Anmeldung werden deine Daten online gespeichert und sind auf all deinen Geräten verfügbar. Jeder sieht nur seine eigenen Daten.</p>
+    <div id="aMailWrap"><label class="lbl" for="aMail" style="margin-top:14px">E-Mail</label><input class="field" id="aMail" type="email" autocomplete="email" inputmode="email" autocapitalize="off" spellcheck="false"></div>
+    <div id="aPwWrap"><label class="lbl" for="aPw" style="margin-top:12px">Passwort (mind. 8 Zeichen)</label><input class="field" id="aPw" type="password" autocomplete="current-password"></div>
+    <p class="err" id="aErr" hidden role="alert"></p>
+    <div class="row" style="margin-top:16px"><button class="btn solid" id="aLogin" type="button">Anmelden</button><button class="btn" id="aSignup" type="button">Neu registrieren</button></div>
+    <div class="row" style="margin-top:10px"><button class="btn" id="aForgot" type="button">Passwort vergessen</button><button class="btn" id="aLocal" type="button">Ohne Anmeldung</button></div>
+    <p class="status" id="aLocalInfo" style="margin-top:10px">„Ohne Anmeldung“: Daten bleiben nur in diesem Browser auf diesem Gerät.</p>
+  </div>
+</div>
 <script>
 (function(){
 'use strict';
-const USE_CLOUD=false;
 const DEF={
   groups:[],
   types:['CR123A','AA','AAA','CR2032','CR2','CR2450','18650','9V','LR44','Akku (intern)'],
@@ -206,36 +223,131 @@ const L=k=>(DEF[k]||[]).concat(S[k]||[]).filter(x=>!HID(k).includes(x));
 const tplFor=g=>((DEF.tpl[g]||[]).concat((S.tpl||{})[g]||[])).filter(x=>!HID('tpl').includes(g+'|'+x));
 function toggleArr(a,v){const i=a.indexOf(v);if(i>=0)a.splice(i,1);else a.push(v)}
 
-/* ---------- Speicher ---------- */
-const store={cloud:false,ref:null,
-  async init(){
-    try{
-      if(!USE_CLOUD||!window.claude||typeof window.claude.use!=='function'){setStatus();return}
-      const [db,user]=await Promise.all([window.claude.use('db'),window.claude.use('user')]);
-      const id=user?await user.id():null;if(!db||!id){setStatus();return}
-      this.ref=db.doc('data/users/'+id+'/batterien');this.cloud=true;
-      const pending=LS.get('ba_pending',false);
-      this.ref.onSnapshot(s=>{
-        if(s.exists&&!LS.get('ba_pending',false)){let d=s.data()||{};try{d=typeof d.json==='string'?JSON.parse(d.json):JSON.parse(JSON.stringify(d))}catch(x){d={}}
-          S=Object.assign(blankS(),d);LS.set('ba_data',S);applyTheme();renderProfile();refresh()}
-        else this.save()
-      },()=>{});
-      if(pending)this.save();
-    }catch(e){this.cloud=false}
-    setStatus();
-  },
-  async save(){LS.set('ba_data',S);
-    if(this.cloud){try{await this.ref.set({json:JSON.stringify(S),v:1});LS.set('ba_pending',false)}catch(e){LS.set('ba_pending',true);toast('Speichern im Konto fehlgeschlagen – lokal gesichert')}}
-    else if(USE_CLOUD)LS.set('ba_pending',true)}
+/* ---------- Online-Speicher (Supabase) ---------- */
+const SB_URL='https://nglnsybapnukpmqgwwxo.supabase.co';
+const SB_KEY='sb_publishable_g10YcvUwLLCIu_V5TKDpqQ_qF-5uYl7';
+const APP_ID='batterien';
+const SITE=location.origin+location.pathname;
+let SES=LS.get('ba_session',null);
+async function sbFetch(path,opt,auth){opt=opt||{};if(auth===undefined)auth=true;
+  const h=Object.assign({'apikey':SB_KEY,'Content-Type':'application/json'},opt.headers||{});
+  if(auth&&SES&&SES.access_token)h.Authorization='Bearer '+SES.access_token;
+  const r=await fetch(SB_URL+path,Object.assign({},opt,{headers:h}));
+  const t=await r.text();let j=null;try{j=t?JSON.parse(t):null}catch(e){}
+  if(!r.ok){const e=new Error((j&&(j.msg||j.message||j.error_description||j.error))||('Fehler '+r.status));e.status=r.status;e.code=j&&(j.error_code||j.code);throw e}
+  return j}
+function setSession(j){if(!j||!j.access_token){SES=null;LS.set('ba_session',null);return}
+  const u=j.user||(SES&&SES.user)||{};
+  SES={access_token:j.access_token,refresh_token:j.refresh_token,expires_at:+j.expires_at||Math.floor(Date.now()/1000)+(+j.expires_in||3600),user:{id:u.id,email:u.email}};
+  LS.set('ba_session',SES)}
+async function ensureSession(){if(!SES)return false;
+  if(SES.expires_at-60>Date.now()/1000)return true;
+  try{setSession(await sbFetch('/auth/v1/token?grant_type=refresh_token',{method:'POST',body:JSON.stringify({refresh_token:SES.refresh_token})},false));return true}
+  catch(e){if(e.status>=400&&e.status<500){setSession(null);renderProfile();showLogin('Bitte erneut anmelden.')}return false}}
+function deErr(e){const m=String(e&&e.message||e);
+  if(/invalid login credentials/i.test(m))return 'E-Mail oder Passwort falsch.';
+  if(/already (been )?registered|already exists/i.test(m))return 'Für diese E-Mail gibt es schon ein Konto. Bitte „Anmelden“ verwenden.';
+  if(/password.*(at least|characters)|weak/i.test(m))return 'Passwort zu kurz oder zu einfach (mindestens 8 Zeichen).';
+  if(/email not confirmed/i.test(m))return 'E-Mail-Adresse ist noch nicht bestätigt. Bitte den Link in der Bestätigungs-Mail öffnen.';
+  if(/rate limit|too many|security purposes/i.test(m))return 'Zu viele Versuche. Bitte in ein paar Minuten erneut probieren.';
+  if(/signups? not allowed|signup.*disabled/i.test(m))return 'Neue Registrierungen sind derzeit ausgeschaltet.';
+  if(/valid email|invalid.*email|unable to validate email/i.test(m))return 'Bitte eine gültige E-Mail-Adresse eingeben.';
+  if(/api key|apikey/i.test(m))return 'Verbindung zum Server abgelehnt (Schlüssel). Bitte dem Ersteller der App melden.';
+  if(/failed to fetch|networkerror|load failed|network/i.test(m))return 'Keine Verbindung zum Server. Bitte Internetverbindung prüfen.';
+  return m}
+const store={cloud:false,timer:null,busy:false,again:false,
+  init(){return this.pull()},
+  async pull(){if(!SES){setStatus();return}
+    if(!await ensureSession()){setStatus();return}
+    if(LS.get('ba_pending',false)){await this.push();return}
+    try{const rows=await sbFetch('/rest/v1/app_data?select=data&app=eq.'+APP_ID);this.cloud=true;
+      if(rows&&rows.length){const d=rows[0].data||{};if(!LS.get('ba_pending',false)){S=Object.assign(blankS(),JSON.parse(JSON.stringify(d)));LS.set('ba_data',S);applyTheme();renderProfile();refresh()}}
+      else await this.push()}
+    catch(e){this.cloud=false;if(e.status===401){setSession(null);renderProfile();showLogin('Sitzung abgelaufen. Bitte erneut anmelden.')}}
+    setStatus()},
+  save(){LS.set('ba_data',S);if(!SES){setStatus();return}
+    LS.set('ba_pending',true);setStatus();clearTimeout(this.timer);this.timer=setTimeout(()=>this.push(),600)},
+  async push(){if(!SES)return;if(this.busy){this.again=true;return}this.busy=true;
+    try{if(!await ensureSession())throw new Error('offline');
+      await sbFetch('/rest/v1/app_data?on_conflict=user_id,app',{method:'POST',headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({user_id:SES.user.id,app:APP_ID,data:S,updated_at:new Date().toISOString()})});
+      LS.set('ba_pending',false);this.cloud=true}
+    catch(e){this.cloud=false;if(e.status===401){setSession(null);renderProfile();showLogin('Sitzung abgelaufen. Bitte erneut anmelden – deine Änderungen bleiben erhalten.')}}
+    this.busy=false;setStatus();if(this.again){this.again=false;this.push()}}
 };
 function save(){store.save()}
+window.addEventListener('online',()=>{if(SES)store.pull()});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&SES)store.pull()});
+
+/* ---------- Anmeldung ---------- */
+let authMode='login';
+function setAErr(t,ok){const e=$('aErr');e.textContent=t||'';e.hidden=!t;e.classList.toggle('ok',!!ok)}
+function aBusy(b){['aLogin','aSignup','aForgot','aLocal'].forEach(id=>{$(id).disabled=b})}
+function showLogin(msg){authMode='login';$('auth').hidden=false;$('authApp').textContent=(S.title||'Batterien und Dokumente').toUpperCase();
+  $('authTitle').textContent='ANMELDUNG';$('authInfo').hidden=false;$('aMailWrap').hidden=false;$('aPwWrap').hidden=false;
+  ['aSignup','aForgot','aLocal','aLocalInfo'].forEach(id=>{$(id).hidden=false});$('aLogin').textContent='Anmelden';
+  $('aPw').setAttribute('autocomplete','current-password');setAErr(msg||'');setTimeout(()=>{try{$('aMail').focus()}catch(e){}},50)}
+function showReset(){authMode='reset';$('auth').hidden=false;$('authTitle').textContent='NEUES PASSWORT';$('authInfo').hidden=true;
+  $('aMailWrap').hidden=true;$('aPwWrap').hidden=false;['aSignup','aForgot','aLocal','aLocalInfo'].forEach(id=>{$(id).hidden=true});
+  $('aLogin').textContent='Passwort speichern';$('aPw').value='';$('aPw').setAttribute('autocomplete','new-password');setAErr('');setTimeout(()=>{try{$('aPw').focus()}catch(e){}},50)}
+function hideLogin(){$('auth').hidden=true}
+async function afterLogin(){hideLogin();LS.set('ba_localOnly',false);toast('Angemeldet');
+  try{const rows=await sbFetch('/rest/v1/app_data?select=data&app=eq.'+APP_ID);
+    if(rows&&rows.length){const c=Object.assign(blankS(),JSON.parse(JSON.stringify(rows[0].data||{})));let n=0;
+      (S.items||[]).forEach(it=>{if(it&&it.id&&!c.items.some(x=>x.id===it.id)){c.items.push(it);n++}});
+      ['groups','types','slots'].forEach(k=>(S[k]||[]).forEach(v=>{c[k]=c[k]||[];if(!c[k].includes(v)){c[k].push(v);n++}}));
+      Object.entries(S.tpl||{}).forEach(([g,arr])=>(arr||[]).forEach(v=>{c.tpl=c.tpl||{};c.tpl[g]=c.tpl[g]||[];if(!c.tpl[g].includes(v)){c.tpl[g].push(v);n++}}));
+      ['name','unit'].forEach(k=>{if(!c[k]&&S[k]){c[k]=S[k];n++}});
+      S=c;LS.set('ba_data',S);if(n)store.save();else LS.set('ba_pending',false);store.cloud=true}
+    else{store.save()}}
+  catch(e){LS.set('ba_pending',true)}
+  applyTheme();renderProfile();render();setStatus()}
+async function logout(){
+  if(LS.get('ba_pending',false)&&!window.confirm('Einige Änderungen sind noch nicht online gespeichert und gehen beim Abmelden verloren. Trotzdem abmelden?'))return;
+  try{if(SES)await sbFetch('/auth/v1/logout',{method:'POST'})}catch(e){}
+  setSession(null);LS.set('ba_data',null);LS.set('ba_pending',false);LS.set('ba_localOnly',false);
+  S=blankS();store.cloud=false;openProfile(false);applyTheme();renderProfile();if(location.hash!=='#liste')location.hash='#liste';else render();showLogin()}
+$('aLogin').addEventListener('click',async()=>{const mail=$('aMail').value.trim(),pw=$('aPw').value;
+  if(authMode==='reset'){if(pw.length<8)return setAErr('Bitte mindestens 8 Zeichen eingeben.');aBusy(true);
+    try{await ensureSession();await sbFetch('/auth/v1/user',{method:'PUT',body:JSON.stringify({password:pw})});$('aPw').value='';toast('Neues Passwort gespeichert');await afterLogin()}catch(e){setAErr(deErr(e))}
+    aBusy(false);return}
+  if(!mail||!pw)return setAErr('Bitte E-Mail und Passwort eingeben.');aBusy(true);
+  try{setSession(await sbFetch('/auth/v1/token?grant_type=password',{method:'POST',body:JSON.stringify({email:mail,password:pw})},false));$('aPw').value='';await afterLogin()}
+  catch(e){setAErr(deErr(e))}aBusy(false)});
+$('aSignup').addEventListener('click',async()=>{const mail=$('aMail').value.trim(),pw=$('aPw').value;
+  if(!mail)return setAErr('Bitte E-Mail eingeben.');if(pw.length<8)return setAErr('Bitte ein Passwort mit mindestens 8 Zeichen wählen.');aBusy(true);
+  try{const j=await sbFetch('/auth/v1/signup',{method:'POST',body:JSON.stringify({email:mail,password:pw})},false);
+    if(j&&j.access_token){setSession(j);$('aPw').value='';toast('Konto angelegt');await afterLogin()}
+    else if(j&&Array.isArray(j.identities)&&!j.identities.length)setAErr('Für diese E-Mail gibt es schon ein Konto. Bitte „Anmelden“ verwenden.');
+    else setAErr('Konto angelegt. Bitte den Bestätigungslink in der E-Mail öffnen und danach hier anmelden.',true)}
+  catch(e){setAErr(deErr(e))}aBusy(false)});
+$('aForgot').addEventListener('click',async()=>{const mail=$('aMail').value.trim();if(!mail)return setAErr('Bitte zuerst deine E-Mail eingeben.');aBusy(true);
+  try{await sbFetch('/auth/v1/recover?redirect_to='+encodeURIComponent(SITE),{method:'POST',body:JSON.stringify({email:mail})},false);
+    setAErr('Falls ein Konto besteht, kommt gleich eine E-Mail mit einem Link. Öffne den Link im selben Browser und vergib dort ein neues Passwort.',true)}
+  catch(e){setAErr(deErr(e))}aBusy(false)});
+$('aLocal').addEventListener('click',()=>{LS.set('ba_localOnly',true);hideLogin();setStatus();render()});
+$('aPw').addEventListener('keydown',e=>{if(e.key==='Enter')$('aLogin').click()});
+$('aMail').addEventListener('keydown',e=>{if(e.key==='Enter')$('aPw').focus()});
+document.addEventListener('click',e=>{const t=e.target.closest&&e.target.closest('[data-act]');if(!t)return;
+  if(t.dataset.act==='logout')logout();else if(t.dataset.act==='login'){openProfile(false);showLogin()}});
+async function handleAuthHash(){const h=location.hash||'';if(!/access_token=|error=|error_code=/.test(h))return;
+  const p=new URLSearchParams(h.slice(1));try{history.replaceState(null,'',location.pathname+location.search)}catch(e){}
+  if(p.get('error')||p.get('error_code')){showLogin('Der Link ist ungültig oder abgelaufen. Bitte „Passwort vergessen“ erneut verwenden.');return 'shown'}
+  SES=null;setSession({access_token:p.get('access_token'),refresh_token:p.get('refresh_token'),expires_at:p.get('expires_at'),expires_in:p.get('expires_in')});
+  try{const u=await sbFetch('/auth/v1/user');SES.user={id:u.id,email:u.email};LS.set('ba_session',SES)}catch(e){}
+  if(p.get('type')==='recovery'){showReset();return 'shown'}
+  await afterLogin();return 'shown'}
+
 function storageHint(){
+  if(SES)return LS.get('ba_pending',false)&&!navigator.onLine?`<div class="alertbar" style="cursor:default;background:var(--duebg);border-color:var(--due);color:var(--due)"><b>Offline</b><span>Deine Änderungen sind auf diesem Gerät gespeichert und werden übertragen, sobald wieder Internet da ist.</span></div>`:'';
   if(!STORE_OK)return `<div class="alertbar" role="alert" style="cursor:default"><b>⚠ Speichern ist in dieser Ansicht nicht möglich</b><span>Deine Einträge gehen beim Schließen verloren. Öffne den Link bitte direkt in Safari (iPhone) oder Chrome (Android) und füge die Seite dort zum Home-Bildschirm hinzu.</span></div>`;
   const last=LS.get('ba_lastBackup','');const n=S.items.length;
   const old=n&&(!last||dayDiff(today(),last)>30);
   return (IN_APP?`<div class="alertbar" style="cursor:default;background:var(--duebg);border-color:var(--due);color:var(--due)"><b>Tipp: Link im richtigen Browser öffnen</b><span>Du nutzt die Seite in einer App (z. B. WhatsApp). Dort werden Daten oft beim Schließen gelöscht. Öffne den Link in Safari bzw. Chrome und füge ihn zum Home-Bildschirm hinzu.</span></div>`:'')
    +(old?`<a class="alertbar" href="#mehr" style="text-decoration:none;background:var(--duebg);border-color:var(--due);color:var(--due)"><b>Sicherung empfohlen</b><span>${last?'Letzte Sicherung am '+fmtD(last):'Noch keine Sicherung gespeichert'}. Unter Mehr › „Sicherung speichern“ legst du eine Datei an, mit der du alles wiederherstellen kannst.</span></a>`:'')}
-function setStatus(){const el=$('syncState');if(el)el.innerHTML=!USE_CLOUD?'Speicherung: <b>nur in diesem Browser</b> · regelmäßig unter Mehr › Sicherung speichern':store.cloud?'Speicherung: in deinem Konto · auf allen Geräten':'Speicherung: <b>nur auf diesem Gerät</b> · wird übertragen, sobald dein Konto erreichbar ist'}
+function setStatus(){const el=$('syncState');if(!el)return;
+  el.innerHTML=!SES?'Speicherung: <b>nur in diesem Browser</b> · für Online-Speicherung oben bei Name/Einheit anmelden'
+   :LS.get('ba_pending',false)?(navigator.onLine?'Speicherung: wird online übertragen …':'Speicherung: <b>offline</b> · wird übertragen, sobald Internet da ist')
+   :'Speicherung: online in deinem Konto ('+esc(SES.user&&SES.user.email||'')+') · auf allen Geräten aktuell'}
 
 /* ---------- Tag / Nacht ---------- */
 function isNightNow(){const h=new Date().getHours(),a=+S.nightFrom,b=+S.dayFrom;return a>b?(h>=a||h<b):(h>=a&&h<b)}
@@ -246,7 +358,8 @@ $('modeBtn').addEventListener('click',()=>{themeMode={auto:'tag',tag:'nacht',nac
 setInterval(()=>{applyTheme();if(view==='liste'||view==='faellig')render()},60000);
 
 /* ---------- Name / Einheit ---------- */
-function renderProfile(){const t=[S.name,S.unit].filter(Boolean).join(' · ');$('profBtn').textContent=(t||'Name und Einheit eintragen')+' ✎';$('appTitle').textContent=(S.title||'Batterien und Dokumente').toUpperCase()}
+function renderProfile(){const t=[S.name,S.unit].filter(Boolean).join(' · ');$('profBtn').textContent=(t||'Name und Einheit eintragen')+' ✎';$('appTitle').textContent=(S.title||'Batterien und Dokumente').toUpperCase();
+  const ac=$('acct');if(ac)ac.innerHTML=SES?'Angemeldet als <b>'+esc(SES.user&&SES.user.email||'')+'</b> · Daten werden online gespeichert.<br><button class="btn" type="button" data-act="logout" style="margin-top:8px">Abmelden</button>':'Nicht angemeldet · Daten nur in diesem Browser.<br><button class="btn" type="button" data-act="login" style="margin-top:8px">Anmelden / Registrieren</button>'}
 function openProfile(o){$('profPanel').hidden=!o;$('profBtn').setAttribute('aria-expanded',o?'true':'false');if(o){$('pName').value=S.name||'';$('pUnit').value=S.unit||'';$('pTitle').value=S.title||'';$('pName').focus()}}
 $('profBtn').addEventListener('click',()=>openProfile($('profPanel').hidden));
 $('pCancel').addEventListener('click',()=>openProfile(false));
@@ -470,8 +583,8 @@ function viewMehr(){const hours=Array.from({length:24},(_,h)=>h);
       <div><label class="lbl" for="sD">Tag ab</label><select class="field" id="sD">${hours.map(h=>`<option value="${h}"${+S.dayFrom===h?' selected':''}>${pad(h)}:00 Uhr</option>`).join('')}</select></div></div></div>
     <div class="sec"><span class="lbl">Übersicht</span><p style="margin:0">${S.items.length} Gegenstände · ${allSlots().length} Batterie-Untergruppen · ${allSlots().reduce((t,x)=>t+(+x.sl.count||1),0)} Batterien eingesetzt</p>
       <p class="status">Bedarf nach Typ: ${esc(Object.entries(allSlots().reduce((o,x)=>{o[x.sl.type]=(o[x.sl.type]||0)+(+x.sl.count||1);return o},{})).map(([t,n])=>n+'× '+t).join(', ')||'–')}</p></div>
-    <div class="sec"><span class="lbl">Speicherung auf diesem Gerät</span><p style="margin:0">${STORE_OK?'Speichern funktioniert in dieser Ansicht.':'<b style="color:var(--bad)">Speichern funktioniert in dieser Ansicht nicht.</b>'}${PERSIST===true?' Dauerhafte Speicherung ist vom Browser bestätigt.':''}</p>
-      <p class="status">Die Daten bleiben nur in diesem Browser auf diesem Gerät. Damit nichts verloren geht: Link in Safari (iPhone) bzw. Chrome (Android) öffnen, über „Teilen“ bzw. „⋮“ → „Zum Home-Bildschirm“ hinzufügen und immer von dort starten. Regelmäßig eine Sicherung speichern. Letzte Sicherung: ${esc(LS.get('ba_lastBackup','')?fmtD(LS.get('ba_lastBackup','')):'noch keine')}.</p></div>
+    <div class="sec"><span class="lbl">Konto und Speicherung</span>${SES?`<p style="margin:0">Angemeldet als <b>${esc(SES.user&&SES.user.email||'')}</b></p><p class="status">Deine Daten werden online gespeichert und sind auf jedem Gerät verfügbar, auf dem du dich anmeldest. Zusätzlich kannst du gelegentlich eine Sicherung als Datei speichern.</p><div class="row"><button class="btn" type="button" data-act="logout">Abmelden</button></div>`
+      :`<p style="margin:0"><b>Nicht angemeldet</b> · Daten nur in diesem Browser auf diesem Gerät.</p><p class="status">Melde dich an oder registriere dich, damit deine Daten online gespeichert werden und nicht verloren gehen. Bereits erfasste Gegenstände werden dabei übernommen.</p><div class="row"><button class="btn solid" type="button" data-act="login">Anmelden / Registrieren</button></div>`}</div>
     <div class="sec"><span class="lbl">Export und Sicherung</span><div class="row"><button class="btn" type="button" id="expCsv">Liste als CSV (Excel)</button><button class="btn" type="button" id="expJson">Sicherung speichern</button><button class="btn" type="button" id="impBtn">Sicherung einlesen</button></div>
       <input type="file" id="impFile" accept=".json,application/json" hidden><p class="err" id="expErr" hidden></p><p class="status" id="syncState"></p></div>`;
   $('sN').addEventListener('change',e=>{S.nightFrom=+e.target.value;save();applyTheme()});$('sD').addEventListener('change',e=>{S.dayFrom=+e.target.value;save();applyTheme()});
@@ -500,7 +613,8 @@ function refresh(){if(view==='neu'||(view==='gegenstand'&&(slotForm||editSlot)))
 function route(){const h=(location.hash||'').slice(1);const v=VIEWS[h]?h:'liste';if(v==='neu'&&view!=='neu'){F=null;rmMode={key:null,sel:[]}}view=v;render();window.scrollTo(0,0)}
 function remindOnce(){if(bannerShown)return;const al=alerts();if(!al.length)return;bannerShown=true;toast('⚠ '+al.length+' Batteriewechsel '+(al.some(x=>x.st.k==='bad')?'fällig':'bald fällig')+' – siehe „Fällig“')}
 window.addEventListener('hashchange',route);
-applyTheme();renderProfile();route();setTimeout(remindOnce,600);store.init();
+applyTheme();renderProfile();
+handleAuthHash().then(r=>{route();setTimeout(remindOnce,600);if(r)return;if(SES)store.init();else if(!LS.get('ba_localOnly',false))showLogin();setStatus()});
 })();
 </script>
 
